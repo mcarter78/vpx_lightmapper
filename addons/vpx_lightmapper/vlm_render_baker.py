@@ -143,12 +143,189 @@ def get_light_receivers(light):
     return names
 
 
+# ---- skip under-playfield bulbs that can't reach the target ----------------------------------------------------------
+# An insert's bulb sits under the playfield; its light only gets out through the insert window above it. VLM's
+# radius AOI doesn't know the wood is in the way, so it bakes such bulbs against parts across the table that come
+# out black (a 4K test batch: 375 of 385 insert-lamp unwrapped bakes had p99 < 0.01). A light is skipped for
+# a set of targets when ALL of these hold:
+#  - it is a real LIGHT, not light-linked (linked lights go through the light-linking AOI above), below the playfield
+#  - an insert window is found straight above it (first small object a ray up meets within 5 cm)
+#  - no target has points at/under the playfield within REACH_UNDER_R of the bulb (the playfield, inserts and
+#    nearby under-playfield parts are always kept)
+#  - no target vertex lies inside the cone from the bulb through the window (window grown by 4 mm), or the nearest
+#    in-cone vertex gets less than REACH_MIN_IRRADIANCE W/m^2 (power / distance^2; 16x below the dimmest useful
+#    test table case) - direct light only: bounce-only contributions through an insert are negligible and VLM prunes them.
+# Off switch: bpy.context.scene['vlm_reach_skip'] = False.
+REACH_PF_Z = 0.0                  # playfield top (VLM imports the playfield at z 0)
+REACH_WINDOW_RAY = 0.05           # m: how far above the bulb the insert must be
+REACH_WINDOW_MAX = 0.25           # m: a hit object larger than this is not an insert window (the playfield is ~0.5 m; the test table's inserts are up to 0.13 m)
+REACH_MARGIN = 0.004              # m: window growth
+REACH_MIN_IRRADIANCE = 5.0        # W / m^2 at the nearest in-cone target vertex
+REACH_UNDER_R = 0.20              # m: parts under the playfield within this of the bulb are always kept
+REACH_UNDER_DZ = 0.002            # m: a point counts as under the playfield below this depth (flipper bats touch z 0)
+
+_reach_cache = {}   # cleared at the start of every render_all_groups run (lights and parts may have moved)
+
+
+def _light_power(light):
+    """Power of a LIGHT the way get_light_influence_radius computes it (energy x summed Emission Strength, 1 without
+    an Emission node), or None when it cannot be trusted (enable_aoi off, linked Strength): then nothing is skipped."""
+    if not light.vlmSettings.enable_aoi:
+        return None
+    strength, has_emission = 0.0, False
+    if light.data.use_nodes and light.data.node_tree:
+        for n in light.data.node_tree.nodes:
+            if n.bl_idname == 'ShaderNodeEmission':
+                if n.inputs['Strength'].is_linked:
+                    return None
+                has_emission = True
+                strength += n.inputs['Strength'].default_value
+    return max(light.data.energy * (strength if has_emission else 1.0), 0.0)
+
+
+def _reach_hull(P):
+    P = sorted(set(map(tuple, np.round(P, 6))))
+    if len(P) < 3:
+        return None
+    def cr(o, a, b): return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
+    lo, up = [], []
+    for q in P:
+        while len(lo) >= 2 and cr(lo[-2], lo[-1], q) <= 0: lo.pop()
+        lo.append(q)
+    for q in reversed(P):
+        while len(up) >= 2 and cr(up[-2], up[-1], q) <= 0: up.pop()
+        up.append(q)
+    H = np.array(lo[:-1] + up[:-1])
+    c = H.mean(0); d = H - c; n = np.linalg.norm(d, axis=1, keepdims=True)
+    return c + d * (1 + REACH_MARGIN / np.maximum(n, 1e-9))
+
+
+def _reach_world_verts(obj, depsgraph):
+    """(world vertices (n, 3), triangles (m, 3)) of the evaluated object, cached."""
+    key = ('verts', obj.name)
+    if key not in _reach_cache:
+        res = (None, None)
+        try:
+            ev = obj.evaluated_get(depsgraph)
+            me = ev.to_mesh()
+            if me is not None and len(me.vertices):
+                co = np.empty(len(me.vertices) * 3, np.float32); me.vertices.foreach_get('co', co); co = co.reshape(-1, 3)
+                M = np.array(obj.matrix_world); W = co @ M[:3, :3].T + M[:3, 3]
+                me.calc_loop_triangles()
+                T = np.empty(len(me.loop_triangles) * 3, np.int32); me.loop_triangles.foreach_get('vertices', T)
+                res = (W, T.reshape(-1, 3))
+            ev.to_mesh_clear()
+        except Exception:
+            res = (None, None)
+        _reach_cache[key] = res
+    return _reach_cache[key]
+
+
+def _seg_cross(p1, p2, q1, q2):
+    """Proper intersection of segments p1-p2 (arrays (n, 2)) with q1-q2 (single), vectorised over n."""
+    def orient(a, b, c):
+        return (b[..., 0] - a[..., 0]) * (c[..., 1] - a[..., 1]) - (b[..., 1] - a[..., 1]) * (c[..., 0] - a[..., 0])
+    d1, d2 = orient(q1, q2, p1), orient(q1, q2, p2)
+    d3, d4 = orient(p1, p2, q1), orient(p1, p2, q2)
+    return (d1 * d2 < 0) & (d3 * d4 < 0)
+
+
+def _reach_window(light, depsgraph):
+    key = ('window', light.name)
+    if key not in _reach_cache:
+        H = None
+        try:
+            sc = bpy.context.scene
+            q = light.matrix_world.translation.copy()
+            for _ in range(6):
+                ok, loc, nrm, idx, ob, mx = sc.ray_cast(depsgraph, q, Vector((0, 0, 1)), distance=REACH_WINDOW_RAY)
+                if not ok:
+                    break
+                o = bpy.data.objects.get(ob.name)
+                bb = [o.matrix_world @ Vector(c) for c in o.bound_box] if o else []
+                if bb and max(max(v.x for v in bb) - min(v.x for v in bb), max(v.y for v in bb) - min(v.y for v in bb)) <= REACH_WINDOW_MAX:
+                    W, _t = _reach_world_verts(o, depsgraph)
+                    H = _reach_hull(W[:, :2]) if W is not None else None
+                    break
+                q = loc + Vector((0, 0, 1e-4))
+        except Exception:
+            H = None
+        _reach_cache[key] = H
+    return _reach_cache[key]
+
+
+def _reach_target(light, obj, depsgraph):
+    """True unless the under-playfield bulb provably cannot light obj directly through its insert window.
+    Tested on TRIANGLES (a big face can cross the cone with no vertex inside it, e.g. the playfield's 4 corners)."""
+    key = ('reach', light.name, obj.name)
+    if key in _reach_cache:
+        return _reach_cache[key]
+    res = True
+    P = np.array(light.matrix_world.translation)
+    H = _reach_window(light, depsgraph)
+    W, T = _reach_world_verts(obj, depsgraph)
+    if H is not None and W is not None and T is not None and len(T):
+        z = W[:, 2]
+        under = z < REACH_PF_Z - REACH_UNDER_DZ
+        level = ~under & (z <= REACH_PF_Z + REACH_UNDER_DZ)
+        keep = False
+        # parts under the playfield are open to the bulb (no wood between): keep within REACH_UNDER_R
+        if under.any() and np.linalg.norm(W[under] - P, axis=1).min() <= REACH_UNDER_R:
+            keep = True
+        # parts lying at playfield level (the playfield, inserts, decals): keep when their footprint covers the window
+        if not keep and level.any():
+            L = W[level][:, :2]
+            if ((H.min(0) <= L.max(0)) & (H.max(0) >= L.min(0))).all():
+                keep = True
+        if not keep:
+            above_v = z > REACH_PF_Z + REACH_UNDER_DZ
+            tri = T[above_v[T].all(1)]                      # triangles wholly above the playfield
+            if len(tri):
+                s_ = (REACH_PF_Z - P[2]) / (W[:, 2] - P[2])
+                Q = P[:2] + (W[:, :2] - P[:2]) * s_[:, None]  # central projection through the bulb onto the playfield
+                ins_v = np.ones(len(Q), bool)
+                for a_, b_ in zip(H, np.roll(H, -1, 0)):
+                    ins_v &= (b_[0]-a_[0])*(Q[:, 1]-a_[1]) - (b_[1]-a_[1])*(Q[:, 0]-a_[0]) >= 0
+                hit = ins_v[tri].any(1)
+                rest = ~hit
+                if rest.any():
+                    A, B, C = Q[tri[rest, 0]], Q[tri[rest, 1]], Q[tri[rest, 2]]
+                    h = np.zeros(rest.sum(), bool)
+                    for hv in H:                            # a window corner inside the projected triangle
+                        d1 = (B[:, 0]-A[:, 0])*(hv[1]-A[:, 1]) - (B[:, 1]-A[:, 1])*(hv[0]-A[:, 0])
+                        d2 = (C[:, 0]-B[:, 0])*(hv[1]-B[:, 1]) - (C[:, 1]-B[:, 1])*(hv[0]-B[:, 0])
+                        d3 = (A[:, 0]-C[:, 0])*(hv[1]-C[:, 1]) - (A[:, 1]-C[:, 1])*(hv[0]-C[:, 0])
+                        h |= ((d1 >= 0) & (d2 >= 0) & (d3 >= 0)) | ((d1 <= 0) & (d2 <= 0) & (d3 <= 0))
+                    for q1, q2 in zip(H, np.roll(H, -1, 0)):  # edge crossings
+                        h |= _seg_cross(A, B, q1, q2) | _seg_cross(B, C, q1, q2) | _seg_cross(C, A, q1, q2)
+                    hit[np.nonzero(rest)[0]] = h
+                if hit.any():
+                    d = float(np.linalg.norm(W[np.unique(tri[hit])] - P, axis=1).min())
+                    keep = _light_power(light) / max(d * d, 1e-9) >= REACH_MIN_IRRADIANCE
+        res = keep
+    _reach_cache[key] = res
+    return res
+
+
+def light_reaches_targets(light, targets, depsgraph):
+    """False only for an unlinked LIGHT below the playfield that reaches none of the targets (see above)."""
+    if not bpy.context.scene.get('vlm_reach_skip', True) or not targets:
+        return True
+    if getattr(light, 'type', None) != 'LIGHT' or light.matrix_world.translation.z >= REACH_PF_Z:
+        return True
+    if _light_power(light) is None:
+        return True
+    return any(_reach_target(light, t, depsgraph) for t in targets if t is not None and t.type in {'MESH', 'CURVE', 'SURFACE', 'META', 'FONT'})
+
+
 def get_light_influence(scene, depsgraph, camera, light, group_mask, targets=None):
     """Light-linking aware wrapper of the original AOI computation. targets = objects being rendered/baked."""
     receivers = get_light_receivers(light)
     # Opt-in (scene['vlm_light_link_aoi'] = True): the linked receivers still bounce this light onto other objects in Cycles,
     # and skipping/cropping drops that bounce, so leave it off until a test bake shows it is negligible for the table.
     if receivers is None or not bpy.context.scene.get('vlm_light_link_aoi', False):
+        if targets is not None and not light_reaches_targets(light, targets, depsgraph):
+            return None
         return _get_light_influence_orig(scene, depsgraph, camera, light, group_mask)
     if targets is not None and not any(t.name in receivers for t in targets):
         return None
@@ -330,6 +507,7 @@ def render_all_groups(op, context):
     if context.blend_data.filepath == '':
         op.report({'ERROR'}, 'You must save your project before rendering')
         return {'CANCELLED'}
+    _reach_cache.clear()
 
     bake_col = vlm_collections.get_collection(context.scene.collection, 'VLM.Bake', create=False)
     if not bake_col:
